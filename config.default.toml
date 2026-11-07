@@ -1,0 +1,22 @@
+# JX-11 Ring Remapper Configuration
+# Restart the daemon after editing this file.
+
+[device]
+name = "JX-11"
+mac  = "52:f8:0e:22:06:f2"
+
+[gestures]
+# Scroll wheel (event21)
+scroll_up    = "XF86AudioRaiseVolume"
+scroll_down  = "XF86AudioLowerVolume"
+
+# Directional presses on the wheel (event21)
+button_left  = "XF86AudioPrev"
+button_right = "XF86AudioNext"
+
+# Center tap on the wheel (event21)
+button_center = "XF86AudioPlay"
+
+# Discrete buttons (event20 consumer control)
+center_button = "XF86AudioMute"   # Center button (default: KEY_VOLUMEDOWN)
+select_button = ""                # Other select button (default: KEY_VOLUMEUP)

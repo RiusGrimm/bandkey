@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""JX-11 Bluetooth Ring Key Remapper for Linux.
+
+Grabs all evdev nodes belonging to the JX-11 ring, discards their default
+events, and emits synthetic keyboard events via uinput according to a TOML
+configuration file.
+
+Physical controls (from sniffer output):
+  event20 — Consumer Control (discrete buttons)
+    KEY_VOLUMEDOWN  → center_button (center button, default: volume down)
+    KEY_VOLUMEUP    → select_button (other select button)
+  event21 — Digitizer / scroll wheel surface
+    Y decreases     → scroll_up
+    Y increases     → scroll_down
+    X decreases     → button_left
+    X increases     → button_right
+    no movement     → button_center (tap the center of the wheel)
+"""
+import os
+import select
+import struct
+import sys
+import time
+
+# ---------------------------------------------------------------------------
+# Optional python-evdev
+# ---------------------------------------------------------------------------
+try:
+    import evdev
+    from evdev import ecodes, UInput
+    _HAS_EVDEV = True
+except ImportError:
+    _HAS_EVDEV = False
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+CONFIG_PATH = os.path.expanduser("~/.config/jx11-remapper/config.toml")
+
+DEFAULT_CONFIG = '''\
+# JX-11 Ring Remapper Configuration
+# Restart the daemon after editing this file.
+
+[device]
+name = "JX-11"
+mac  = "52:f8:0e:22:06:f2"
+
+[gestures]
+# Scroll wheel (event21)
+scroll_up    = "XF86AudioRaiseVolume"
+scroll_down  = "XF86AudioLowerVolume"
+
+# Directional presses on the wheel (event21)
+button_left  = "XF86AudioPrev"
+button_right = "XF86AudioNext"
+
+# Center tap on the wheel (event21)
+button_center = "XF86AudioPlay"
+
+# Discrete buttons (event20 consumer control)
+center_button = "XF86AudioMute"   # Center button (default: KEY_VOLUMEDOWN)
+select_button = ""                # Other select button (default: KEY_VOLUMEUP)
+'''
+
+# ---------------------------------------------------------------------------
+# evdev constants (pure-Python path)
+# ---------------------------------------------------------------------------
+EVENT_FORMAT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+
+EV_SYN = 0x00
+EV_KEY = 0x01
+EV_ABS = 0x03
+
+EVIOCGRAB = 0x40044590
+
+KEY_VOLUMEDOWN = 114
+KEY_VOLUMEUP   = 115
+BTN_TOUCH = 330
+
+ABS_X = 0
+ABS_Y = 1
+ABS_MT_POSITION_X = 53
+ABS_MT_POSITION_Y = 54
+ABS_MT_TRACKING_ID = 57
+
+# ---------------------------------------------------------------------------
+# Key name → code table
+# ---------------------------------------------------------------------------
+KEY_NAME_TO_CODE = {
+    # letters
+    "A": 30, "B": 48, "C": 46, "D": 32, "E": 18, "F": 33, "G": 34, "H": 35,
+    "I": 23, "J": 36, "K": 37, "L": 38, "M": 50, "N": 49, "O": 24, "P": 25,
+    "Q": 16, "R": 19, "S": 31, "T": 20, "U": 22, "V": 47, "W": 17, "X": 45,
+    "Y": 21, "Z": 44,
+    # digits
+    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+    # function keys
+    "F1": 59, "F2": 60, "F3": 61, "F4": 62, "F5": 63, "F6": 64,
+    "F7": 65, "F8": 66, "F9": 67, "F10": 68, "F11": 87, "F12": 88,
+    # modifiers
+    "LEFTCTRL": 29, "RIGHTCTRL": 97, "LEFTSHIFT": 42, "RIGHTSHIFT": 54,
+    "LEFTALT": 56, "RIGHTALT": 100, "LEFTMETA": 125, "RIGHTMETA": 126,
+    "CAPSLOCK": 58, "NUMLOCK": 69, "SCROLLLOCK": 70,
+    # special
+    "ENTER": 28, "ESC": 1, "BACKSPACE": 14, "TAB": 15, "SPACE": 57,
+    "GRAVE": 41, "BACKQUOTE": 41, "TILDE": 41,
+    "DELETE": 111, "INSERT": 110, "HOME": 102, "END": 107,
+    "PAGEUP": 104, "PAGEDOWN": 109,
+    "UP": 103, "DOWN": 108, "LEFT": 105, "RIGHT": 106,
+    # media / consumer
+    "XF86AUDIOPREV": 165, "XF86AUDIONEXT": 163, "XF86AUDIOPLAY": 164,
+    "XF86AUDIOSTOP": 128, "XF86AUDIOMUTE": 113,
+    "XF86AUDIORAISEVOLUME": 115, "XF86AUDIOLOWERVOLUME": 114,
+    "XF86CALCULATOR": 140, "XF86HOMEPAGE": 172, "XF86MAIL": 155,
+    "XF86MEDIA": 396, "XF86SEARCH": 217, "XF86SLEEP": 142,
+    "XF86TOOLS": 194, "XF86WAKEUP": 143, "XF86WWW": 150,
+    # aliases
+    "CTRL": 29, "SHIFT": 42, "ALT": 56, "META": 125, "SUPER": 125,
+    "PLAYPAUSE": 164, "PREV": 165, "NEXT": 163, "MUTE": 113,
+    "VOLUP": 115, "VOLDOWN": 114,
+}
+
+for _k, _v in list(KEY_NAME_TO_CODE.items()):
+    KEY_NAME_TO_CODE.setdefault(f"KEY_{_k}", _v)
+for _k, _v in list(KEY_NAME_TO_CODE.items()):
+    KEY_NAME_TO_CODE.setdefault(_k.lower(), _v)
+
+# ---------------------------------------------------------------------------
+# uinput (ctypes fallback)
+# ---------------------------------------------------------------------------
+import ctypes
+import fcntl
+
+UI_DEV_CREATE = 0x5501
+UI_DEV_DESTROY = 0x5502
+UI_SET_EVBIT = 0x40045564
+UI_SET_KEYBIT = 0x40045565
+
+UINPUT_KEY = 0x01
+UINPUT_SYN = 0x00
+
+class MinimalUInput:
+    def __init__(self, name=b"JX-11 Virtual Keyboard"):
+        self._fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self._fd, UI_SET_EVBIT, UINPUT_KEY)
+        fcntl.ioctl(self._fd, UI_SET_EVBIT, UINPUT_SYN)
+        for code in range(256):
+            try:
+                fcntl.ioctl(self._fd, UI_SET_KEYBIT, code)
+            except OSError:
+                pass
+        UI_DEV_SETUP = 0x40504580
+        setup = struct.pack("HHHHH80s", 0x03, 0, 0, 1, 0, name[:79])
+        try:
+            fcntl.ioctl(self._fd, UI_DEV_SETUP, setup)
+        except OSError:
+            pass
+        fcntl.ioctl(self._fd, UI_DEV_CREATE)
+
+    def write(self, typ, code, value):
+        os.write(self._fd, struct.pack("llHHi", 0, 0, typ, code, value))
+
+    def syn(self):
+        self.write(UINPUT_SYN, 0, 0)
+
+    def close(self):
+        try:
+            fcntl.ioctl(self._fd, UI_DEV_DESTROY)
+        except OSError:
+            pass
+        os.close(self._fd)
+
+    def __del__(self):
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# Config parsing
+# ---------------------------------------------------------------------------
+def parse_config():
+    if not os.path.isfile(CONFIG_PATH):
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            f.write(DEFAULT_CONFIG)
+        print(f"Created default config at {CONFIG_PATH}")
+        return parse_config()
+
+    # Try proper TOML parsers first
+    try:
+        import tomllib
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"WARNING: Could not parse config with tomllib: {exc}")
+        print(f"  File: {CONFIG_PATH}")
+        # Print the problematic line for debugging
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                lines = f.readlines()
+            # Heuristic: find line with unclosed quote or embedded newline
+            for i, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith("#") or not stripped:
+                    continue
+                quote_count = stripped.count('"')
+                if quote_count % 2 != 0 and "=" in stripped:
+                    print(f"  Possible bad line {i}: {stripped!r}")
+        except Exception:
+            pass
+        print("  Falling back to inline parser...")
+
+    try:
+        import toml
+        with open(CONFIG_PATH, "r") as f:
+            return toml.load(f)
+    except ImportError:
+        pass
+    except Exception as exc:
+        print(f"WARNING: Could not parse config with toml: {exc}")
+        print("  Falling back to inline parser...")
+
+    # Inline fallback parser — very permissive
+    cfg = {"device": {}, "gestures": {}}
+    section = None
+    with open(CONFIG_PATH, "r") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip().strip('"').strip("'")
+            val = val.strip().strip('"').strip("'")
+            if section:
+                cfg.setdefault(section, {})[key] = val
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Key helpers
+# ---------------------------------------------------------------------------
+def parse_key(name):
+    if isinstance(name, int):
+        return name
+    name = name.strip()
+    code = KEY_NAME_TO_CODE.get(name)
+    if code is not None:
+        return code
+    code = KEY_NAME_TO_CODE.get(name.upper())
+    if code is not None:
+        return code
+    bare = name.upper()
+    for pfx in ("KEY_", "BTN_", "EV_"):
+        if bare.startswith(pfx):
+            code = KEY_NAME_TO_CODE.get(bare[len(pfx):])
+            if code is not None:
+                return code
+    raise ValueError(f"Unknown key name: {name!r}")
+
+
+def emit_keys(ui, key_string):
+    """Emit a discrete key press + release (tap)."""
+    if not key_string:
+        return
+    parts = [p.strip() for p in key_string.split("+")]
+    codes = [parse_key(p) for p in parts]
+    for c in codes:
+        ui.write(EV_KEY, c, 1)
+    ui.syn()
+    for c in reversed(codes):
+        ui.write(EV_KEY, c, 0)
+    ui.syn()
+
+
+def emit_key_press(ui, key_string):
+    """Press and hold a key or chord. Returns the list of held key codes."""
+    if not key_string:
+        return []
+    parts = [p.strip() for p in key_string.split("+")]
+    codes = [parse_key(p) for p in parts]
+    for c in codes:
+        ui.write(EV_KEY, c, 1)
+    ui.syn()
+    return codes
+
+
+def emit_key_release(ui, codes):
+    """Release previously held keys (reverse order)."""
+    for c in reversed(codes):
+        ui.write(EV_KEY, c, 0)
+    ui.syn()
+
+
+# ---------------------------------------------------------------------------
+# Device discovery
+# ---------------------------------------------------------------------------
+def find_jx11_devices(config):
+    name_match = config.get("device", {}).get("name", "JX-11")
+    mac_match = config.get("device", {}).get("mac", "52:f8:0e:22:06:f2").lower()
+    found = []
+    for dev_name in os.listdir("/sys/class/input/"):
+        if not dev_name.startswith("event"):
+            continue
+        uevent_path = f"/sys/class/input/{dev_name}/device/uevent"
+        try:
+            with open(uevent_path) as fp:
+                txt = fp.read()
+        except (FileNotFoundError, PermissionError):
+            continue
+        if (name_match in txt or mac_match in txt) and "Virtual Keyboard" not in txt:
+            found.append((f"/dev/input/{dev_name}", dev_name))
+    return found
+
+
+# ---------------------------------------------------------------------------
+# Discrete button state tracker (event20)  — TOGGLE behaviour
+# ---------------------------------------------------------------------------
+class DiscreteButtonState:
+    """Tracks toggled press/release for physical discrete buttons."""
+
+    def __init__(self, gesture_map, ui):
+        self.gesture_map = gesture_map
+        self.ui = ui
+        # Maps physical key code -> currently held virtual key codes
+        self.held = {}
+
+    def on_event(self, code, value):
+        """Toggle on physical press (value==1); ignore release and repeat."""
+        if code == KEY_VOLUMEDOWN:
+            gesture_key = "center_button"
+        elif code == KEY_VOLUMEUP:
+            gesture_key = "select_button"
+        else:
+            return
+
+        mapped = self.gesture_map.get(gesture_key, "")
+        if not mapped:
+            return
+
+        if value != 1:  # Only act on physical press
+            return
+
+        if code in self.held:
+            # Key is currently held → release it (toggle off)
+            codes = self.held.pop(code)
+            emit_key_release(self.ui, codes)
+        else:
+            # Key is not held → press it (toggle on)
+            codes = emit_key_press(self.ui, mapped)
+            if codes:
+                self.held[code] = codes
+
+
+# ---------------------------------------------------------------------------
+# Gesture state machine for the scroll wheel (event21)  — TOGGLE behaviour
+# ---------------------------------------------------------------------------
+class WheelState:
+    TAP_THRESHOLD = 80
+    DIR_THRESHOLD = 150
+    TAP_MAX_MS = 400
+
+    def __init__(self, gesture_map, ui):
+        self.gesture_map = gesture_map
+        self.ui = ui
+        self.active = False
+        self.start_x = 0
+        self.start_y = 0
+        self.last_x = 0
+        self.last_y = 0
+        self.start_time = 0
+        self.held_codes = []   # currently held key codes for center-tap toggle
+        self.canceled = False  # True if movement stole the gesture from tap
+
+    def on_touch_start(self, x, y):
+        if self.active:
+            return
+        self.active = True
+        self.start_x = x
+        self.start_y = y
+        self.last_x = x
+        self.last_y = y
+        self.start_time = time.monotonic()
+        self.canceled = False
+
+    def on_update(self, x, y):
+        if not self.active or self.canceled:
+            return
+        self.last_x = x
+        self.last_y = y
+
+        dx = self.last_x - self.start_x
+        dy = self.last_y - self.start_y
+        if abs(dx) > self.TAP_THRESHOLD or abs(dy) > self.TAP_THRESHOLD:
+            # Movement detected — this is a scroll or directional gesture.
+            self.canceled = True
+
+    def on_touch_end(self):
+        if not self.active:
+            return
+        self.active = False
+        dx = self.last_x - self.start_x
+        dy = self.last_y - self.start_y
+        adx, ady = abs(dx), abs(dy)
+
+        if not self.canceled:
+            # No significant movement — this was a center tap: TOGGLE center key.
+            center_key = self.gesture_map.get("button_center", "")
+            self._toggle_center(center_key)
+            return
+
+        # Movement gesture — emit discrete action at touch end (one-shot, not toggle)
+        if adx > ady and adx > self.DIR_THRESHOLD:
+            emit_keys(self.ui, self.gesture_map.get("button_right" if dx > 0 else "button_left", ""))
+        elif ady > adx and ady > self.DIR_THRESHOLD:
+            emit_keys(self.ui, self.gesture_map.get("scroll_up" if dy > 0 else "scroll_down", ""))
+
+    def _toggle_center(self, key_string):
+        """Toggle center button: press if not held, release if held."""
+        if self.held_codes:
+            emit_key_release(self.ui, self.held_codes)
+            self.held_codes = []
+        elif key_string:
+            self.held_codes = emit_key_press(self.ui, key_string)
+
+
+# ---------------------------------------------------------------------------
+# Pure-Python event loop
+# ---------------------------------------------------------------------------
+def run_pure_python(config, ui):
+    gesture_map = config.get("gestures", {})
+    wheel = WheelState(gesture_map, ui)
+    discrete = DiscreteButtonState(gesture_map, ui)
+    fds = {}
+
+    while True:
+        devices = find_jx11_devices(config)
+        wanted = {p for p, _ in devices}
+        for fd, path in list(fds.items()):
+            if path not in wanted:
+                try:
+                    fcntl.ioctl(fd, EVIOCGRAB, 0)
+                    os.close(fd)
+                except OSError:
+                    pass
+                del fds[fd]
+        for path, _ in devices:
+            if path not in fds.values():
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    fcntl.ioctl(fd, EVIOCGRAB, 1)
+                    fds[fd] = path
+                    print(f"  grabbed {path}")
+                except PermissionError:
+                    print(f"  permission denied: {path}")
+                    print("    Run:  ~/.local/bin/jx11-remapper --check")
+                    print("    Fix:  sudo ./setup-permissions.sh  (then log out & back in)")
+        if not fds:
+            print("Waiting for JX-11 to appear...")
+            time.sleep(2)
+            continue
+
+        try:
+            readable, _, _ = select.select(list(fds.keys()), [], [], 2.0)
+            for fd in readable:
+                data = os.read(fd, EVENT_SIZE)
+                if len(data) != EVENT_SIZE:
+                    continue
+                _, _, typ, code, value = struct.unpack(EVENT_FORMAT, data)
+                if typ == EV_SYN:
+                    continue
+
+                path = fds[fd]
+
+                # Consumer-control buttons (event20 style)
+                if typ == EV_KEY:
+                    if code == KEY_VOLUMEDOWN or code == KEY_VOLUMEUP:
+                        discrete.on_event(code, value)
+                    elif code == BTN_TOUCH:
+                        if value == 1:
+                            wheel.on_touch_start(wheel.last_x, wheel.last_y)
+                    continue
+
+                # Scroll wheel / directional tracking (event21 style)
+                if typ == EV_ABS:
+                    if code in (ABS_X, ABS_MT_POSITION_X):
+                        wheel.last_x = value
+                        if wheel.active:
+                            wheel.on_update(wheel.last_x, wheel.last_y)
+                    elif code in (ABS_Y, ABS_MT_POSITION_Y):
+                        wheel.last_y = value
+                        if wheel.active:
+                            wheel.on_update(wheel.last_x, wheel.last_y)
+                    elif code == ABS_MT_TRACKING_ID:
+                        if value == -1:
+                            wheel.on_touch_end()
+                        elif value >= 0:
+                            wheel.on_touch_start(wheel.last_x, wheel.last_y)
+                    continue
+
+        except (OSError, ValueError) as exc:
+            for fd in list(fds.keys()):
+                try:
+                    fcntl.ioctl(fd, EVIOCGRAB, 0)
+                    os.close(fd)
+                except OSError:
+                    pass
+            fds.clear()
+            print(f"Device lost ({exc}), reconnecting...")
+            time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# python-evdev event loop
+# ---------------------------------------------------------------------------
+def run_evdev(config, ui):
+    gesture_map = config.get("gestures", {})
+    wheel = WheelState(gesture_map, ui)
+    discrete = DiscreteButtonState(gesture_map, ui)
+    devices = []
+
+    def open_devices():
+        nonlocal devices
+        for d in devices:
+            try:
+                d.ungrab()
+            except Exception:
+                pass
+            try:
+                d.close()
+            except Exception:
+                pass
+        devices = []
+        for path, _ in find_jx11_devices(config):
+            try:
+                dev = evdev.InputDevice(path)
+                dev.grab()
+                devices.append(dev)
+                print(f"  grabbed {path} ({dev.name})")
+            except Exception as exc:
+                print(f"  cannot grab {path}: {exc}")
+                print("    Run:  ~/.local/bin/jx11-remapper --check")
+                print("    Fix:  sudo ./setup-permissions.sh  (then log out & back in)")
+
+    print("JX-11 remapper running. Press Ctrl-C to stop.")
+    open_devices()
+
+    if not devices:
+        print("Waiting for JX-11 to appear...")
+        time.sleep(2)
+
+    while True:
+        r, _, _ = select.select(devices, [], [], 2.0)
+        if not r:
+            fresh = find_jx11_devices(config)
+            if len({p for p, _ in fresh}) != len(devices):
+                print("Device change detected, re-grabbing...")
+                open_devices()
+            continue
+
+        for dev in r:
+            try:
+                for event in dev.read():
+                    if event.type == ecodes.EV_KEY:
+                        code = event.code
+                        if code == ecodes.KEY_VOLUMEDOWN or code == ecodes.KEY_VOLUMEUP:
+                            discrete.on_event(code, event.value)
+                        elif code == ecodes.BTN_TOUCH:
+                            if event.value == 1:
+                                wheel.on_touch_start(wheel.last_x, wheel.last_y)
+
+                    elif event.type == ecodes.EV_ABS:
+                        code = event.code
+                        if code in (ecodes.ABS_X, ecodes.ABS_MT_POSITION_X):
+                            wheel.last_x = event.value
+                            if wheel.active:
+                                wheel.on_update(wheel.last_x, wheel.last_y)
+                        elif code in (ecodes.ABS_Y, ecodes.ABS_MT_POSITION_Y):
+                            wheel.last_y = event.value
+                            if wheel.active:
+                                wheel.on_update(wheel.last_x, wheel.last_y)
+                        elif code == ecodes.ABS_MT_TRACKING_ID:
+                            if event.value == -1:
+                                wheel.on_touch_end()
+                            elif event.value >= 0:
+                                wheel.on_touch_start(wheel.last_x, wheel.last_y)
+
+            except OSError:
+                print(f"Lost {dev.path}, reconnecting...")
+                open_devices()
+                break
+
+
+# ---------------------------------------------------------------------------
+# Permission diagnostics
+# ---------------------------------------------------------------------------
+def check_permissions(config):
+    """Print a diagnostic report and exit."""
+    print("=" * 60)
+    print("JX-11 Remapper Permission Check")
+    print("=" * 60)
+
+    # Check input group
+    import grp
+    import getpass
+    user = getpass.getuser()
+    try:
+        input_group = grp.getgrnam("input")
+        if user in input_group.gr_mem:
+            print(f"✓ User '{user}' is in 'input' group")
+        else:
+            print(f"✗ User '{user}' is NOT in 'input' group")
+            print("  Fix: sudo usermod -aG input $USER  (then log out & back in)")
+    except KeyError:
+        print("✗ 'input' group does not exist on this system")
+
+    # Check uinput
+    if os.access("/dev/uinput", os.W_OK):
+        print("✓ Can write to /dev/uinput")
+    else:
+        print("✗ Cannot write to /dev/uinput")
+        print("  Fix: run ./setup-permissions.sh or add udev rule")
+
+    # Check JX-11 devices
+    devices = find_jx11_devices(config)
+    if not devices:
+        print("✗ No JX-11 devices found in /sys/class/input")
+        print("  Make sure the ring is paired and connected.")
+    else:
+        print(f"✓ Found {len(devices)} JX-11 device node(s):")
+        for path, name in devices:
+            readable = os.access(path, os.R_OK)
+            grab_ok = False
+            if readable:
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+                    fcntl.ioctl(fd, EVIOCGRAB, 1)
+                    fcntl.ioctl(fd, EVIOCGRAB, 0)
+                    os.close(fd)
+                    grab_ok = True
+                except Exception:
+                    pass
+            status = "✓ readable & grab OK" if grab_ok else "✗ permission denied"
+            print(f"    {path} ({name}) → {status}")
+
+    print("=" * 60)
+    if devices and all(os.access(p, os.R_OK) for p, _ in devices):
+        print("All checks passed. You can run the daemon.")
+    else:
+        print("Run: sudo ./setup-permissions.sh")
+        print("Then log out and log back in for group changes to apply.")
+    print("=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--check", "-c"):
+        check_permissions(parse_config())
+        return
+
+    config = parse_config()
+
+    if _HAS_EVDEV:
+        ui = UInput(name="JX-11 Virtual Keyboard")
+        run = run_evdev
+    else:
+        print("WARNING: python-evdev not installed — using minimal fallback.")
+        print("Install it for full functionality:  sudo pacman -S python-evdev")
+        ui = MinimalUInput()
+        run = run_pure_python
+
+    try:
+        run(config, ui)
+    except KeyboardInterrupt:
+        print("\nExiting.")
+    finally:
+        try:
+            ui.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

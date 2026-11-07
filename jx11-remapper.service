@@ -1,0 +1,12 @@
+[Unit]
+Description=JX-11 Bluetooth Ring Key Remapper
+After=graphical-session.target bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/jx11-remapper
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

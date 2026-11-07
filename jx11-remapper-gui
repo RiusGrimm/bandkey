@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""JX-11 Ring Remapper — Desktop Configuration GUI (Tkinter).
+
+A native desktop app for configuring the JX-11 Bluetooth ring remapper.
+No browser needed. Supports profiles, key testing, and daemon restart.
+"""
+import os
+import struct
+import subprocess
+import sys
+import time
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+CONFIG_PATH = os.path.expanduser("~/.config/jx11-remapper/config.toml")
+
+# ---------------------------------------------------------------------------
+# Key name → code table (same as daemon)
+# ---------------------------------------------------------------------------
+KEY_NAME_TO_CODE = {
+    "A": 30, "B": 48, "C": 46, "D": 32, "E": 18, "F": 33, "G": 34, "H": 35,
+    "I": 23, "J": 36, "K": 37, "L": 38, "M": 50, "N": 49, "O": 24, "P": 25,
+    "Q": 16, "R": 19, "S": 31, "T": 20, "U": 22, "V": 47, "W": 17, "X": 45,
+    "Y": 21, "Z": 44,
+    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6, "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+    "F1": 59, "F2": 60, "F3": 61, "F4": 62, "F5": 63, "F6": 64,
+    "F7": 65, "F8": 66, "F9": 67, "F10": 68, "F11": 87, "F12": 88,
+    "LEFTCTRL": 29, "RIGHTCTRL": 97, "LEFTSHIFT": 42, "RIGHTSHIFT": 54,
+    "LEFTALT": 56, "RIGHTALT": 100, "LEFTMETA": 125, "RIGHTMETA": 126,
+    "CAPSLOCK": 58, "NUMLOCK": 69, "SCROLLLOCK": 70,
+    "ENTER": 28, "ESC": 1, "BACKSPACE": 14, "TAB": 15, "SPACE": 57,
+    "GRAVE": 41, "BACKQUOTE": 41, "TILDE": 41,
+    "DELETE": 111, "INSERT": 110, "HOME": 102, "END": 107,
+    "PAGEUP": 104, "PAGEDOWN": 109,
+    "UP": 103, "DOWN": 108, "LEFT": 105, "RIGHT": 106,
+    "XF86AUDIOPREV": 165, "XF86AUDIONEXT": 163, "XF86AUDIOPLAY": 164,
+    "XF86AUDIOSTOP": 128, "XF86AUDIOMUTE": 113,
+    "XF86AUDIORAISEVOLUME": 115, "XF86AUDIOLOWERVOLUME": 114,
+    "XF86CALCULATOR": 140, "XF86HOMEPAGE": 172, "XF86MAIL": 155,
+    "XF86MEDIA": 396, "XF86SEARCH": 217, "XF86SLEEP": 142,
+    "XF86TOOLS": 194, "XF86WAKEUP": 143, "XF86WWW": 150,
+    "CTRL": 29, "SHIFT": 42, "ALT": 56, "META": 125, "SUPER": 125,
+    "PLAYPAUSE": 164, "PREV": 165, "NEXT": 163, "MUTE": 113,
+    "VOLUP": 115, "VOLDOWN": 114,
+}
+for _k, _v in list(KEY_NAME_TO_CODE.items()):
+    KEY_NAME_TO_CODE.setdefault(f"KEY_{_k}", _v)
+for _k, _v in list(KEY_NAME_TO_CODE.items()):
+    KEY_NAME_TO_CODE.setdefault(_k.lower(), _v)
+
+# Sorted list for autocomplete / suggestions
+ALL_KEY_NAMES = sorted({k for k in KEY_NAME_TO_CODE if not k.startswith(("KEY_", "BTN_"))},
+                       key=lambda s: s.lower())
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+CONTROLS = [
+    ("scroll_up",     "Scroll Wheel Up",    "Rotate wheel up"),
+    ("scroll_down",   "Scroll Wheel Down",  "Rotate wheel down"),
+    ("button_left",   "Left Button",        "Press left side of wheel"),
+    ("button_right",  "Right Button",       "Press right side of wheel"),
+    ("button_center", "Center Button",      "Tap center of wheel"),
+    ("center_button", "Center Button (2)",  "Discrete center button"),
+    ("select_button", "Select Button",      "Other discrete button"),
+]
+
+PROFILES = {
+    "Media Controls": {
+        "scroll_up": "XF86AudioRaiseVolume",
+        "scroll_down": "XF86AudioLowerVolume",
+        "button_left": "XF86AudioPrev",
+        "button_right": "XF86AudioNext",
+        "button_center": "XF86AudioPlay",
+        "center_button": "XF86AudioMute",
+        "select_button": "",
+    },
+    "Keyboard Backtick (`)": {
+        "scroll_up": "",
+        "scroll_down": "",
+        "button_left": "Grave",
+        "button_right": "Grave",
+        "button_center": "Grave",
+        "center_button": "Grave",
+        "select_button": "Grave",
+    },
+    "Voice AI (Riff)": {
+        "scroll_up": "XF86AudioRaiseVolume",
+        "scroll_down": "XF86AudioLowerVolume",
+        "button_left": "Backspace",
+        "button_right": "Enter",
+        "button_center": "LeftAlt",
+        "center_button": "Esc",
+        "select_button": "",
+    },
+    "Custom": {},  # populated from current config
+}
+
+# ---------------------------------------------------------------------------
+# Config I/O
+# ---------------------------------------------------------------------------
+def read_config():
+    if not os.path.isfile(CONFIG_PATH):
+        return {}
+    try:
+        import tomllib
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f).get("gestures", {})
+    except ImportError:
+        pass
+    try:
+        import toml
+        with open(CONFIG_PATH, "r") as f:
+            return toml.load(f).get("gestures", {})
+    except ImportError:
+        pass
+    # Inline fallback
+    cfg = {}
+    section = None
+    with open(CONFIG_PATH, "r") as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip().strip('"').strip("'")
+            val = val.strip().strip('"').strip("'")
+            if section == "gestures":
+                cfg[key] = val
+    return cfg
+
+
+def write_config(gestures):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    lines = [
+        '# JX-11 Ring Remapper Configuration',
+        '# Generated by jx11-remapper-gui',
+        '',
+        '[device]',
+        'name = "JX-11"',
+        'mac  = "52:f8:0e:22:06:f2"',
+        '',
+        '[gestures]',
+    ]
+    for key, label, _ in CONTROLS:
+        val = gestures.get(key, "")
+        lines.append(f'{key} = "{val}"')
+    with open(CONFIG_PATH, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Key test (uinput)
+# ---------------------------------------------------------------------------
+def emit_test_key(key_string):
+    if not key_string:
+        return True, "No key mapped"
+    parts = [p.strip() for p in key_string.split("+")]
+    codes = []
+    for p in parts:
+        code = KEY_NAME_TO_CODE.get(p)
+        if code is None:
+            code = KEY_NAME_TO_CODE.get(p.upper())
+        if code is None:
+            code = KEY_NAME_TO_CODE.get(p.lower())
+        if code is None:
+            for pfx in ("KEY_", "BTN_"):
+                if p.upper().startswith(pfx):
+                    code = KEY_NAME_TO_CODE.get(p.upper()[len(pfx):])
+                    if code:
+                        break
+        if code is None:
+            return False, f"Unknown key: {p!r}"
+        codes.append(code)
+
+    import fcntl
+    UINPUT_KEY = 0x01
+    UINPUT_SYN = 0x00
+    UI_SET_EVBIT = 0x40045564
+    UI_SET_KEYBIT = 0x40045565
+    UI_DEV_CREATE = 0x5501
+    UI_DEV_DESTROY = 0x5502
+    UI_DEV_SETUP = 0x40504580
+
+    fd = None
+    try:
+        fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(fd, UI_SET_EVBIT, UINPUT_KEY)
+        fcntl.ioctl(fd, UI_SET_EVBIT, UINPUT_SYN)
+        for c in codes:
+            fcntl.ioctl(fd, UI_SET_KEYBIT, c)
+        setup = struct.pack("HHHHH80s", 0x03, 0, 0, 1, 0, b"JX-11 Test")
+        try:
+            fcntl.ioctl(fd, UI_DEV_SETUP, setup)
+        except OSError:
+            pass
+        fcntl.ioctl(fd, UI_DEV_CREATE)
+
+        for c in codes:
+            os.write(fd, struct.pack("llHHi", 0, 0, UINPUT_KEY, c, 1))
+        os.write(fd, struct.pack("llHHi", 0, 0, UINPUT_SYN, 0, 0))
+        for c in reversed(codes):
+            os.write(fd, struct.pack("llHHi", 0, 0, UINPUT_KEY, c, 0))
+        os.write(fd, struct.pack("llHHi", 0, 0, UINPUT_SYN, 0, 0))
+        time.sleep(0.05)
+        return True, "OK"
+    except PermissionError:
+        return False, "Permission denied on /dev/uinput"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if fd is not None:
+            try:
+                fcntl.ioctl(fd, UI_DEV_DESTROY)
+            except OSError:
+                pass
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Daemon control
+# ---------------------------------------------------------------------------
+def restart_daemon():
+    try:
+        subprocess.run(["systemctl", "--user", "restart", "jx11-remapper"],
+                       capture_output=True, text=True, check=True)
+        return True, "Daemon restarted"
+    except subprocess.CalledProcessError as exc:
+        return False, exc.stderr or "systemctl failed"
+    except FileNotFoundError:
+        return False, "systemctl not found"
+
+
+def daemon_status():
+    try:
+        result = subprocess.run(["systemctl", "--user", "is-active", "jx11-remapper"],
+                                capture_output=True, text=True)
+        return result.stdout.strip() == "active"
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Main GUI
+# ---------------------------------------------------------------------------
+class RemapperGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("JX-11 Ring Remapper")
+        self.root.geometry("680x720")
+        self.root.configure(bg="#0f0f23")
+        self.root.minsize(600, 600)
+
+        # Dark theme colors
+        self.bg = "#0f0f23"
+        self.fg = "#e0e0e0"
+        self.accent = "#00d4aa"
+        self.card_bg = "#1a1a2e"
+        self.card_border = "#2a2a40"
+        self.input_bg = "#0f0f23"
+        self.input_border = "#3a3a55"
+        self.error = "#ff5555"
+
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure("TFrame", background=self.bg)
+        style.configure("TLabel", background=self.bg, foreground=self.fg, font=("system-ui", 11))
+        style.configure("Header.TLabel", background=self.bg, foreground=self.accent, font=("system-ui", 16, "bold"))
+        style.configure("Desc.TLabel", background=self.bg, foreground="#888888", font=("system-ui", 9))
+        style.configure("TCombobox", fieldbackground=self.input_bg, foreground=self.fg, background=self.card_bg)
+        style.map("TCombobox", fieldbackground=[("readonly", self.input_bg)])
+
+        self.entries = {}
+        self.build_ui()
+        self.load_current_config()
+
+    def build_ui(self):
+        # Header
+        header = ttk.Label(self.root, text="JX-11 Ring Remapper", style="Header.TLabel")
+        header.pack(anchor="w", padx=24, pady=(20, 4))
+
+        sub = ttk.Label(self.root, text="Configure what each button and scroll direction does.", style="Desc.TLabel")
+        sub.pack(anchor="w", padx=24, pady=(0, 16))
+
+        # Profile selector
+        profile_frame = tk.Frame(self.root, bg=self.card_bg, bd=1, relief="solid",
+                                  highlightbackground=self.card_border, highlightthickness=1)
+        profile_frame.pack(fill="x", padx=24, pady=8)
+        profile_inner = tk.Frame(profile_frame, bg=self.card_bg)
+        profile_inner.pack(fill="x", padx=16, pady=12)
+
+        ttk.Label(profile_inner, text="Profile:", background=self.card_bg, foreground=self.fg,
+                  font=("system-ui", 11, "bold")).pack(side="left")
+
+        self.profile_var = tk.StringVar(value="Custom")
+        self.profile_combo = ttk.Combobox(profile_inner, textvariable=self.profile_var,
+                                          values=list(PROFILES.keys()), state="readonly", width=24)
+        self.profile_combo.pack(side="left", padx=(12, 0))
+        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_change)
+
+        # Controls list
+        self.controls_frame = tk.Frame(self.root, bg=self.bg)
+        self.controls_frame.pack(fill="both", expand=True, padx=24, pady=8)
+
+        for key, label, desc in CONTROLS:
+            self.add_control_row(key, label, desc)
+
+        # Buttons
+        btn_frame = tk.Frame(self.root, bg=self.bg)
+        btn_frame.pack(fill="x", padx=24, pady=(8, 4))
+
+        self.save_btn = tk.Button(btn_frame, text="Save & Restart Daemon", bg=self.accent, fg="#000000",
+                                   activebackground="#00e6b8", activeforeground="#000000",
+                                   font=("system-ui", 12, "bold"), bd=0, padx=24, pady=10,
+                                   cursor="hand2", command=self.on_save)
+        self.save_btn.pack(side="left")
+
+        self.status_label = tk.Label(btn_frame, text="", bg=self.bg, fg=self.accent,
+                                      font=("system-ui", 10))
+        self.status_label.pack(side="left", padx=(16, 0))
+
+        # Daemon status bar
+        self.daemon_label = tk.Label(self.root, text="Checking daemon...", bg=self.bg, fg="#888888",
+                                      font=("system-ui", 9))
+        self.daemon_label.pack(anchor="w", padx=24, pady=(4, 20))
+        self.update_daemon_status()
+
+    def add_control_row(self, key, label, desc):
+        card = tk.Frame(self.controls_frame, bg=self.card_bg, bd=1, relief="solid",
+                        highlightbackground=self.card_border, highlightthickness=1)
+        card.pack(fill="x", pady=6)
+
+        inner = tk.Frame(card, bg=self.card_bg)
+        inner.pack(fill="x", padx=16, pady=12)
+
+        left = tk.Frame(inner, bg=self.card_bg)
+        left.pack(side="left", fill="y")
+
+        tk.Label(left, text=label, bg=self.card_bg, fg=self.fg,
+                 font=("system-ui", 11, "bold")).pack(anchor="w")
+        tk.Label(left, text=desc, bg=self.card_bg, fg="#888888",
+                 font=("system-ui", 9)).pack(anchor="w")
+
+        entry = tk.Entry(inner, bg=self.input_bg, fg=self.fg, insertbackground=self.fg,
+                         highlightbackground=self.input_border, highlightthickness=1,
+                         bd=0, font=("system-ui", 11), width=22)
+        entry.pack(side="left", padx=(16, 8), fill="y")
+        self.entries[key] = entry
+
+        test_btn = tk.Button(inner, text="Test", bg=self.card_bg, fg=self.fg,
+                             activebackground=self.accent, activeforeground="#000000",
+                             font=("system-ui", 10), bd=1, padx=12, pady=4,
+                             cursor="hand2",
+                             command=lambda k=key: self.on_test(k))
+        test_btn.pack(side="left")
+
+    def on_profile_change(self, _event=None):
+        name = self.profile_var.get()
+        if name not in PROFILES:
+            return
+        profile = PROFILES[name]
+        for key, label, _ in CONTROLS:
+            val = profile.get(key, "")
+            self.entries[key].delete(0, tk.END)
+            self.entries[key].insert(0, val)
+        self.set_status(f"Loaded profile: {name}")
+
+    def load_current_config(self):
+        cfg = read_config()
+        for key, label, _ in CONTROLS:
+            val = cfg.get(key, "")
+            self.entries[key].delete(0, tk.END)
+            self.entries[key].insert(0, val)
+
+        # Try to detect which profile matches
+        for name, profile in PROFILES.items():
+            if name == "Custom":
+                continue
+            if all(self.entries[k].get() == profile.get(k, "") for k, _, _ in CONTROLS):
+                self.profile_var.set(name)
+                break
+        else:
+            self.profile_var.set("Custom")
+
+    def on_test(self, key):
+        val = self.entries[key].get().strip()
+        ok, msg = emit_test_key(val)
+        if ok:
+            self.set_status(f"Tested: {val or '(none)'}")
+        else:
+            self.set_status(f"Test failed: {msg}", error=True)
+
+    def on_save(self):
+        gestures = {}
+        for key, _, _ in CONTROLS:
+            gestures[key] = self.entries[key].get().strip()
+
+        write_config(gestures)
+        self.set_status("Config saved. Restarting daemon...")
+        self.root.update_idletasks()
+
+        ok, msg = restart_daemon()
+        if ok:
+            self.set_status("Saved & restarted successfully!")
+        else:
+            self.set_status(f"Saved, but restart failed: {msg}", error=True)
+        self.update_daemon_status()
+
+    def set_status(self, text, error=False):
+        self.status_label.config(text=text, fg=self.error if error else self.accent)
+        if error:
+            self.root.after(5000, lambda: self.status_label.config(text="", fg=self.accent))
+
+    def update_daemon_status(self):
+        if daemon_status():
+            self.daemon_label.config(text="● Daemon is running", fg=self.accent)
+        else:
+            self.daemon_label.config(text="● Daemon is not running", fg=self.error)
+
+
+def main():
+    root = tk.Tk()
+    app = RemapperGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

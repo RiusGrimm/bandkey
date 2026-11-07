@@ -1,6 +1,7 @@
 # Bandkey — JX-11 Bluetooth Ring Key Remapper
 
 **Codename:** Bandkey  
+**Repository:** https://github.com/RiusGrimm/bandkey  
 **What it does:** Turns a JX-11 Bluetooth smart ring into a fully customisable human-interface device for Linux. The daemon grabs the ring's raw input, intercepts its media-key events, and remaps them to arbitrary keyboard keys via a virtual `uinput` keyboard. This works on Wayland, X11, and the Linux console.
 
 ## Key behaviour — Toggle, not tap
